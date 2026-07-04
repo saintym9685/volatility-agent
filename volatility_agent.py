@@ -59,6 +59,7 @@ HELP_TEXT = (
     "/심볼 — 차트 직접 요청 (예: /eth, /lab)\n"
     "     현물에 없으면 선물·MEXC까지 자동 검색\n"
     "/help — 이 안내 보기\n\n"
+    "⚡ = 바이낸스 선물 상장 코인 (차트 캡션에도 표시)\n"
     "매일 아침 7:30(KST)에 순위가 자동 발송됩니다."
 )
 
@@ -153,6 +154,71 @@ def scan():
                 print(f"  진행: {i + 1}/{len(symbols)}")
     top7 = sorted(results, key=lambda x: x["v7"]["std_vol"], reverse=True)[:TOP_N]
     top30 = sorted(results, key=lambda x: x["v30"]["std_vol"], reverse=True)[:TOP_N]
+    return annotate_futures(top7, top30)
+
+
+# ============ 바이낸스 선물 상장 확인 ============
+_futures_symbols = None
+_futures_checked = False
+
+
+def get_binance_futures_symbols():
+    """선물 상장 심볼 전체 목록 (fapi 접속 가능할 때). 차단 시 None"""
+    global _futures_symbols, _futures_checked
+    if _futures_checked:
+        return _futures_symbols
+    _futures_checked = True
+    try:
+        r = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=15)
+        if r.status_code == 200:
+            _futures_symbols = {
+                s["symbol"]
+                for s in r.json().get("symbols", [])
+                if s.get("status") == "TRADING"
+                and s.get("contractType") == "PERPETUAL"
+            }
+            print(f"선물 상장 목록 확보: {len(_futures_symbols)}개 (fapi)")
+    except Exception as e:
+        print(f"fapi 접속 불가 → 데이터 저장소 방식으로 확인: {e}")
+    return _futures_symbols
+
+
+def is_binance_futures_listed(symbol):
+    """바이낸스 선물(무기한) 상장·거래 중인지 확인
+    1순위: fapi exchangeInfo (정확, 지역 차단 가능)
+    2순위: data.binance.vision에 어제/그제 데이터 파일 존재 여부 (차단 없음, 하루 지연)
+    """
+    fs = get_binance_futures_symbols()
+    if fs is not None:
+        return symbol in fs
+    for d in (1, 2):
+        date = (datetime.now(timezone.utc) - timedelta(days=d)).strftime("%Y-%m-%d")
+        url = (
+            f"https://data.binance.vision/data/futures/um/daily/klines/"
+            f"{symbol}/1d/{symbol}-1d-{date}.zip"
+        )
+        try:
+            if requests.head(url, timeout=10).status_code == 200:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def annotate_futures(top7, top30):
+    """순위 리스트의 각 코인에 선물 상장 여부(fut) 표시 (병렬 확인)"""
+    union = {r["symbol"] for r in top7} | {r["symbol"] for r in top30}
+    listed = {}
+    get_binance_futures_symbols()  # fapi 가능 여부 먼저 1회 확인
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = {pool.submit(is_binance_futures_listed, s): s for s in union}
+        for f in as_completed(futs):
+            try:
+                listed[futs[f]] = f.result()
+            except Exception:
+                listed[futs[f]] = False
+    for r in top7 + top30:
+        r["fut"] = listed.get(r["symbol"], False)
     return top7, top30
 
 
@@ -233,10 +299,12 @@ def make_chart(symbol):
     v7 = calc_volatility(klines, 7)
     v30 = calc_volatility(klines, 30)
     last_close = float(klines[-1][4])
+    fut_mark = "✅ 상장" if is_binance_futures_listed(symbol) else "❌ 미상장"
     caption = (
         f"📈 {symbol}  현재가 {last_close:g}  [{source}]\n"
         f"{_fmt_vol_line('7일', v7)}\n"
-        f"{_fmt_vol_line('30일', v30)}"
+        f"{_fmt_vol_line('30일', v30)}\n"
+        f"바이낸스 선물: {fut_mark}"
     )
     return buf, caption
 
@@ -270,22 +338,27 @@ def format_message(top7, top30):
     lines.append(f"📊 <b>7일 변동성 TOP {TOP_N}</b>")
     for i, r in enumerate(top7, 1):
         name = r["symbol"].replace("USDT", "")
+        fut = "⚡" if r.get("fut") else ""
         v = r["v7"]
         arrow = "🟢" if v["change_pct"] >= 0 else "🔴"
         lines.append(
-            f"{i}. <b>{name}</b> | 일변동 {v['std_vol']:.1f}% | "
+            f"{i}. <b>{name}</b>{fut} | 일변동 {v['std_vol']:.1f}% | "
             f"레인지 {v['range_pct']:.0f}% | {arrow} {v['change_pct']:+.1f}%"
         )
     lines.append(f"\n📊 <b>30일 변동성 TOP {TOP_N}</b>")
     for i, r in enumerate(top30, 1):
         name = r["symbol"].replace("USDT", "")
+        fut = "⚡" if r.get("fut") else ""
         v = r["v30"]
         arrow = "🟢" if v["change_pct"] >= 0 else "🔴"
         lines.append(
-            f"{i}. <b>{name}</b> | 일변동 {v['std_vol']:.1f}% | "
+            f"{i}. <b>{name}</b>{fut} | 일변동 {v['std_vol']:.1f}% | "
             f"레인지 {v['range_pct']:.0f}% | {arrow} {v['change_pct']:+.1f}%"
         )
-    lines.append(f"\n💬 /1 ~ /{TOP_N} 차트 | /m1 ~ /m{TOP_N} 30일 차트 | /help 도움말")
+    lines.append(
+        f"\n⚡ = 바이낸스 선물 상장\n"
+        f"💬 /1 ~ /{TOP_N} 차트 | /m1 ~ /m{TOP_N} 30일 차트 | /help 도움말"
+    )
     return "\n".join(lines)
 
 
