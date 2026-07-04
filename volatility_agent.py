@@ -58,6 +58,9 @@ HELP_TEXT = (
     f"/m1 ~ /m{TOP_N} — 30일 순위 코인 차트\n"
     "/심볼 — 차트 직접 요청 (예: /eth, /lab)\n"
     "     현물에 없으면 선물·MEXC까지 자동 검색\n"
+    "뒤에 시간봉을 붙이면 해당 봉 차트 (기본: 일봉)\n"
+    "  예: /eth 4h · /1 1h · /m3 15m\n"
+    "  지원: 5m 15m 30m 1h 4h 1d 1w\n"
     "/help — 이 안내 보기\n\n"
     "⚡ = 바이낸스 선물 상장 코인 (차트 캡션에도 표시)\n"
     "매일 아침 7:30(KST)에 순위가 자동 발송됩니다."
@@ -91,13 +94,22 @@ def get_daily_klines(symbol, days=31):
     return r.json()
 
 
-def get_daily_klines_any(symbol, days=CHART_DAYS):
-    """차트용: 현물 → 선물 → MEXC 순으로 시도. 성공 시 (일봉, 소스이름) 반환"""
+# 지원 시간봉 (바이낸스·MEXC 공통 지원 목록)
+VALID_INTERVALS = ("5m", "15m", "30m", "1h", "4h", "1d", "1w")
+# MEXC는 일부 시간봉 표기가 다름
+MEXC_INTERVAL_MAP = {"1h": "60m", "1w": "1W"}
+
+
+def get_klines_any(symbol, interval="1d", limit=CHART_DAYS):
+    """차트용: 현물 → 선물 → MEXC 순으로 시도. 성공 시 (봉데이터, 소스이름) 반환"""
     for source_name, url in KLINE_SOURCES:
+        iv = interval
+        if source_name == "MEXC":
+            iv = MEXC_INTERVAL_MAP.get(interval, interval)
         try:
             r = requests.get(
                 url,
-                params={"symbol": symbol, "interval": "1d", "limit": days},
+                params={"symbol": symbol, "interval": iv, "limit": limit},
                 timeout=15,
             )
             if r.status_code != 200:
@@ -106,8 +118,13 @@ def get_daily_klines_any(symbol, days=CHART_DAYS):
             if isinstance(k, list) and len(k) >= 2:
                 return k, source_name
         except Exception as e:
-            print(f"  {source_name} 조회 실패({symbol}): {e}")
+            print(f"  {source_name} 조회 실패({symbol} {interval}): {e}")
     raise LookupError(symbol)
+
+
+def get_daily_klines_any(symbol, days=CHART_DAYS):
+    """(하위 호환) 일봉 조회"""
+    return get_klines_any(symbol, "1d", days)
 
 
 def calc_volatility(klines, period):
@@ -262,14 +279,15 @@ def _fmt_vol_line(label, v):
     )
 
 
-def make_chart(symbol):
-    """일봉 캔들차트 → (PNG 버퍼, 캡션). 데이터가 짧으면 있는 만큼만 그림"""
-    klines, source = get_daily_klines_any(symbol, days=CHART_DAYS)
+def make_chart(symbol, interval="1d"):
+    """캔들차트 → (PNG 버퍼, 캡션). 시간봉 차트는 한국시간 축으로 표시"""
+    klines, source = get_klines_any(symbol, interval, limit=CHART_DAYS)
 
     # 소스마다 컬럼 수가 다르므로 (바이낸스 12개, MEXC 8개) 앞 6개만 사용
     rows = [k[:6] for k in klines]
     df = pd.DataFrame(rows, columns=["time", "Open", "High", "Low", "Close", "Volume"])
-    df.index = pd.to_datetime(df["time"].astype(float), unit="ms")
+    idx = pd.to_datetime(df["time"].astype(float), unit="ms", utc=True)
+    df.index = idx.dt.tz_convert("Asia/Seoul").dt.tz_localize(None)  # KST 축
     df = df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
 
     style = mpf.make_mpf_style(
@@ -284,9 +302,10 @@ def make_chart(symbol):
     # 데이터 길이에 맞는 이동평균만 표시 (신규 상장 코인 대응)
     mavs = tuple(m for m in (7, 25) if len(df) > m)
 
+    iv_label = interval.upper()
     plot_kwargs = dict(
         type="candle", volume=True, style=style,
-        title=f"\n{symbol}  ({len(df)}D Daily · {source})",
+        title=f"\n{symbol}  ({len(df)} x {iv_label} · {source} · KST)",
         figsize=(11, 7), tight_layout=True,
     )
     if mavs:
@@ -296,14 +315,28 @@ def make_chart(symbol):
     mpf.plot(df, **plot_kwargs, savefig=dict(fname=buf, dpi=110, format="png"))
     buf.seek(0)
 
-    v7 = calc_volatility(klines, 7)
-    v30 = calc_volatility(klines, 30)
     last_close = float(klines[-1][4])
     fut_mark = "✅ 상장" if is_binance_futures_listed(symbol) else "❌ 미상장"
+
+    if interval == "1d":
+        v7 = calc_volatility(klines, 7)
+        v30 = calc_volatility(klines, 30)
+        stat_lines = f"{_fmt_vol_line('7일', v7)}\n{_fmt_vol_line('30일', v30)}"
+    else:
+        # 시간봉: 표시된 구간 전체의 레인지/변동률
+        closes = [float(c[4]) for c in klines]
+        highs = [float(c[2]) for c in klines]
+        lows = [float(c[3]) for c in klines]
+        range_pct = (max(highs) - min(lows)) / min(lows) * 100
+        change_pct = (closes[-1] - closes[0]) / closes[0] * 100
+        stat_lines = (
+            f"표시구간({len(klines)}개 {iv_label}봉): "
+            f"레인지 {range_pct:.1f}% / {change_pct:+.1f}%"
+        )
+
     caption = (
-        f"📈 {symbol}  현재가 {last_close:g}  [{source}]\n"
-        f"{_fmt_vol_line('7일', v7)}\n"
-        f"{_fmt_vol_line('30일', v30)}\n"
+        f"📈 {symbol}  현재가 {last_close:g}  [{source} · {iv_label}]\n"
+        f"{stat_lines}\n"
         f"바이낸스 선물: {fut_mark}"
     )
     return buf, caption
@@ -388,7 +421,11 @@ def parse_command(text, cache):
 
 
 def handle_command(text, cache):
-    cmd = text.strip().lstrip("/").split("@")[0].lower()
+    # "/lab 4h" 형태: 첫 토큰은 명령, 두 번째 토큰은 시간봉 (기본 1d)
+    parts = text.strip().split()
+    first = parts[0]
+    interval = parts[1].lower() if len(parts) > 1 else "1d"
+    cmd = first.lstrip("/").split("@")[0].lower()
 
     if cmd in ("help", "start"):
         send_message(HELP_TEXT)
@@ -401,17 +438,24 @@ def handle_command(text, cache):
         send_message(format_message(cache.top7, cache.top30))
         return
 
+    if interval not in VALID_INTERVALS:
+        send_message(
+            f"❓ 지원하지 않는 시간봉입니다: {interval}\n"
+            f"사용 가능: {' '.join(VALID_INTERVALS)}"
+        )
+        return
+
     if (cmd.isdigit() or (cmd.startswith("m") and cmd[1:].isdigit())) and not cache.top7:
         send_message("🔄 순위 데이터가 없어 먼저 스캔합니다... (30초~1분)")
         cache.update(*scan())
 
-    symbol = parse_command(text, cache)
+    symbol = parse_command(first, cache)
     if not symbol:
         send_message("❓ 알 수 없는 명령입니다. /help 를 입력해 보세요.")
         return
 
     try:
-        buf, caption = make_chart(symbol)
+        buf, caption = make_chart(symbol, interval)
         send_photo(buf, caption)
     except LookupError:
         query = symbol.replace("USDT", "")
