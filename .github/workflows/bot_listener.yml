@@ -1,1 +1,31 @@
+# .github/workflows/bot_listener.yml — 24시간 명령 대기 봇
+name: Telegram Bot Listener
+
+on:
+  schedule:
+    - cron: "0 */5 * * *"   # 5시간마다 새 봇이 교대 근무
+  workflow_dispatch:         # 수동으로 즉시 시작 가능
+
+# 새 봇이 시작되면 이전 봇은 자동 종료 (중복 응답 방지)
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: true
+
+jobs:
+  listen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install requests pandas mplfinance
+      - name: Run bot listener
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_MINUTES: "350"
+        run: python volatility_agent.py listen
 
