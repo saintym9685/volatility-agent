@@ -215,6 +215,27 @@ def format_message(top7, top30):
     return "\n".join(lines)
 
 
+def find_similar_symbols(query, limit=5):
+    """바이낸스 전체 USDT 페어에서 query가 포함된 심볼 검색 (예: 'LAB' → LABUBU 등)"""
+    try:
+        r = requests.get(f"{BINANCE_API}/api/v3/exchangeInfo", timeout=15)
+        r.raise_for_status()
+        matches = []
+        for s in r.json()["symbols"]:
+            sym = s["symbol"]
+            if not sym.endswith("USDT") or s.get("status") != "TRADING":
+                continue
+            base = sym[:-4]  # USDT 제거
+            if query in base:
+                matches.append(base)
+        # 이름이 짧은(=더 비슷한) 순서로 정렬
+        matches.sort(key=len)
+        return matches[:limit]
+    except Exception as e:
+        print(f"유사 심볼 검색 실패: {e}")
+        return []
+
+
 # ============ 명령 처리 ============
 class RankCache:
     """마지막 스캔 결과를 기억해서 /1, /m1 명령과 /show 캐시에 사용"""
@@ -270,7 +291,17 @@ def handle_command(text, cache):
         buf, caption = make_chart(symbol)
         send_photo(buf, caption)
     except requests.HTTPError:
-        send_message(f"⚠️ '{symbol}' 코인을 찾을 수 없습니다. 심볼을 확인해 주세요.")
+        # 정확한 심볼이 없으면 비슷한 이름의 코인을 찾아서 추천
+        query = symbol.replace("USDT", "")
+        similar = find_similar_symbols(query)
+        if similar:
+            suggestions = " ".join(f"/{s.lower()}" for s in similar)
+            send_message(
+                f"⚠️ '{query}' 코인을 찾을 수 없습니다.\n"
+                f"혹시 이 중에 있나요? 👉 {suggestions}"
+            )
+        else:
+            send_message(f"⚠️ '{query}' 코인을 찾을 수 없고, 비슷한 이름도 없습니다.")
     except Exception as e:
         send_message(f"⚠️ {symbol} 차트 생성 실패: {e}")
 
