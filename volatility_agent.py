@@ -1,7 +1,7 @@
 """
-코인 변동성 스크리너 에이전트 v3 (24시간 상시 봇)
+코인 변동성 스크리너 에이전트 v4 (24시간 상시 봇)
 
-실행 모드 (커맨드라인 인자):
+실행 모드:
   python volatility_agent.py scan    → 순위 스캔 후 리스트 1회 발송 (아침 알림용)
   python volatility_agent.py listen  → 상시 대기 모드 (텔레그램 명령 응답)
 
@@ -9,7 +9,7 @@
   /show        최신 변동성 순위 리스트
   /1 ~ /10     7일 변동성 순위 코인 차트
   /m1 ~ /m10   30일 변동성 순위 코인 차트
-  /심볼        차트 직접 요청 (예: /eth, /tlm)
+  /심볼        차트 직접 요청 (현물→선물→MEXC 순으로 검색)
   /help        명령어 안내
 """
 
@@ -29,17 +29,25 @@ import mplfinance as mpf
 
 # ============ 설정 ============
 TOP_N = 10                    # 상위 몇 개 코인을 보여줄지
-MIN_VOLUME_USDT = 10_000_000  # 최소 24h 거래대금 필터
-CHART_DAYS = 60               # 차트에 표시할 일봉 개수
+MIN_VOLUME_USDT = 10_000_000  # 최소 24h 거래대금 필터 (순위 스캔용)
+CHART_DAYS = 60               # 차트에 표시할 최대 일봉 개수
 CACHE_MINUTES = 15            # /show 시 이 시간 내 캐시가 있으면 재사용
 RUN_MINUTES = int(os.environ.get("RUN_MINUTES", "350"))  # listen 모드 1회 근무 시간
-STALE_MESSAGE_MINUTES = 30    # 이보다 오래된 메시지는 무시 (봇 재시작 시 폭주 방지)
+STALE_MESSAGE_MINUTES = 30    # 이보다 오래된 메시지는 무시
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# GitHub Actions(미국 IP)에서도 접속 가능한 바이낸스 공개 데이터 전용 주소
+# 순위 스캔용 기본 소스 (GitHub Actions에서 접속 가능한 바이낸스 현물 공개 데이터)
 BINANCE_API = "https://data-api.binance.vision"
+
+# 차트용 데이터 소스 (순서대로 시도)
+KLINE_SOURCES = [
+    ("Binance Spot", f"{BINANCE_API}/api/v3/klines"),
+    ("Binance Futures", "https://fapi.binance.com/fapi/v1/klines"),
+    ("MEXC", "https://api.mexc.com/api/v3/klines"),
+]
+
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 KST = timezone(timedelta(hours=9))
 
@@ -48,7 +56,8 @@ HELP_TEXT = (
     "/show — 최신 변동성 순위 리스트\n"
     f"/1 ~ /{TOP_N} — 7일 순위 코인 차트\n"
     f"/m1 ~ /m{TOP_N} — 30일 순위 코인 차트\n"
-    "/심볼 — 차트 직접 요청 (예: /eth, /btc)\n"
+    "/심볼 — 차트 직접 요청 (예: /eth, /lab)\n"
+    "     현물에 없으면 선물·MEXC까지 자동 검색\n"
     "/help — 이 안내 보기\n\n"
     "매일 아침 7:30(KST)에 순위가 자동 발송됩니다."
 )
@@ -71,6 +80,7 @@ def get_usdt_symbols():
 
 
 def get_daily_klines(symbol, days=31):
+    """순위 스캔용 (바이낸스 현물 전용, 빠름)"""
     r = requests.get(
         f"{BINANCE_API}/api/v3/klines",
         params={"symbol": symbol, "interval": "1d", "limit": days},
@@ -80,7 +90,27 @@ def get_daily_klines(symbol, days=31):
     return r.json()
 
 
+def get_daily_klines_any(symbol, days=CHART_DAYS):
+    """차트용: 현물 → 선물 → MEXC 순으로 시도. 성공 시 (일봉, 소스이름) 반환"""
+    for source_name, url in KLINE_SOURCES:
+        try:
+            r = requests.get(
+                url,
+                params={"symbol": symbol, "interval": "1d", "limit": days},
+                timeout=15,
+            )
+            if r.status_code != 200:
+                continue
+            k = r.json()
+            if isinstance(k, list) and len(k) >= 2:
+                return k, source_name
+        except Exception as e:
+            print(f"  {source_name} 조회 실패({symbol}): {e}")
+    raise LookupError(symbol)
+
+
 def calc_volatility(klines, period):
+    """데이터가 period일보다 적으면 None 반환 (신규 상장 코인)"""
     k = klines[-period:]
     if len(k) < period:
         return None
@@ -107,7 +137,6 @@ def _scan_one(sym):
 
 
 def scan():
-    """전체 스캔 (병렬 8개 동시 요청으로 속도 개선)"""
     symbols = get_usdt_symbols()
     print(f"스캔 대상: {len(symbols)}개 코인")
     results = []
@@ -127,15 +156,53 @@ def scan():
     return top7, top30
 
 
+# ============ 유사 심볼 검색 ============
+def find_similar_symbols(query, limit=5):
+    """현물+선물+MEXC 전체에서 query가 포함된 심볼 검색"""
+    sources = [
+        f"{BINANCE_API}/api/v3/exchangeInfo",
+        "https://fapi.binance.com/fapi/v1/exchangeInfo",
+        "https://api.mexc.com/api/v3/exchangeInfo",
+    ]
+    found = set()
+    for url in sources:
+        try:
+            r = requests.get(url, timeout=20)
+            if r.status_code != 200:
+                continue
+            for s in r.json().get("symbols", []):
+                sym = s.get("symbol", "")
+                status = s.get("status", "")
+                if not sym.endswith("USDT"):
+                    continue
+                if status not in ("TRADING", "1", "ENABLED", ""):
+                    continue
+                base = sym[:-4]
+                if query in base:
+                    found.add(base)
+        except Exception as e:
+            print(f"유사 심볼 검색 실패({url}): {e}")
+    matches = sorted(found, key=len)
+    return matches[:limit]
+
+
 # ============ 차트 생성 ============
-def make_chart(symbol):
-    """60일 일봉 캔들차트 + MA7/MA25 + 거래량 → PNG 바이트 반환"""
-    klines = get_daily_klines(symbol, days=CHART_DAYS)
-    df = pd.DataFrame(
-        klines,
-        columns=["time", "Open", "High", "Low", "Close", "Volume",
-                 "ct", "qv", "n", "tb", "tq", "ig"],
+def _fmt_vol_line(label, v):
+    if v is None:
+        return f"{label}: 데이터 부족 (신규 상장)"
+    return (
+        f"{label}: 일변동 {v['std_vol']:.1f}% / "
+        f"레인지 {v['range_pct']:.0f}% / {v['change_pct']:+.1f}%"
     )
+
+
+def make_chart(symbol):
+    """일봉 캔들차트 → (PNG 버퍼, 캡션). 데이터가 짧으면 있는 만큼만 그림"""
+    klines, source = get_daily_klines_any(symbol, days=CHART_DAYS)
+
+    # 소스마다 컬럼 수가 다르므로 (바이낸스 12개, MEXC 8개) 앞 6개만 사용
+    rows = [k[:6] for k in klines]
+    df = pd.DataFrame(rows, columns=["time", "Open", "High", "Low", "Close", "Volume"])
     df.index = pd.to_datetime(df["time"].astype(float), unit="ms")
     df = df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
 
@@ -147,22 +214,29 @@ def make_chart(symbol):
         ),
         gridstyle=":",
     )
-    buf = io.BytesIO()
-    mpf.plot(
-        df, type="candle", volume=True, mav=(7, 25), style=style,
-        title=f"\n{symbol}  ({CHART_DAYS}D Daily)",
+
+    # 데이터 길이에 맞는 이동평균만 표시 (신규 상장 코인 대응)
+    mavs = tuple(m for m in (7, 25) if len(df) > m)
+
+    plot_kwargs = dict(
+        type="candle", volume=True, style=style,
+        title=f"\n{symbol}  ({len(df)}D Daily · {source})",
         figsize=(11, 7), tight_layout=True,
-        savefig=dict(fname=buf, dpi=110, format="png"),
     )
+    if mavs:
+        plot_kwargs["mav"] = mavs
+
+    buf = io.BytesIO()
+    mpf.plot(df, **plot_kwargs, savefig=dict(fname=buf, dpi=110, format="png"))
     buf.seek(0)
 
     v7 = calc_volatility(klines, 7)
     v30 = calc_volatility(klines, 30)
     last_close = float(klines[-1][4])
     caption = (
-        f"📈 {symbol}  현재가 {last_close:g}\n"
-        f"7일: 일변동 {v7['std_vol']:.1f}% / 레인지 {v7['range_pct']:.0f}% / {v7['change_pct']:+.1f}%\n"
-        f"30일: 일변동 {v30['std_vol']:.1f}% / 레인지 {v30['range_pct']:.0f}% / {v30['change_pct']:+.1f}%"
+        f"📈 {symbol}  현재가 {last_close:g}  [{source}]\n"
+        f"{_fmt_vol_line('7일', v7)}\n"
+        f"{_fmt_vol_line('30일', v30)}"
     )
     return buf, caption
 
@@ -215,30 +289,8 @@ def format_message(top7, top30):
     return "\n".join(lines)
 
 
-def find_similar_symbols(query, limit=5):
-    """바이낸스 전체 USDT 페어에서 query가 포함된 심볼 검색 (예: 'LAB' → LABUBU 등)"""
-    try:
-        r = requests.get(f"{BINANCE_API}/api/v3/exchangeInfo", timeout=15)
-        r.raise_for_status()
-        matches = []
-        for s in r.json()["symbols"]:
-            sym = s["symbol"]
-            if not sym.endswith("USDT") or s.get("status") != "TRADING":
-                continue
-            base = sym[:-4]  # USDT 제거
-            if query in base:
-                matches.append(base)
-        # 이름이 짧은(=더 비슷한) 순서로 정렬
-        matches.sort(key=len)
-        return matches[:limit]
-    except Exception as e:
-        print(f"유사 심볼 검색 실패: {e}")
-        return []
-
-
 # ============ 명령 처리 ============
 class RankCache:
-    """마지막 스캔 결과를 기억해서 /1, /m1 명령과 /show 캐시에 사용"""
     def __init__(self):
         self.top7, self.top30, self.ts = [], [], 0.0
 
@@ -250,8 +302,7 @@ class RankCache:
 
 
 def parse_command(text, cache):
-    """'/1' → 7일 1위 심볼, '/m3' → 30일 3위, '/tlm' → TLMUSDT"""
-    t = text.strip().lstrip("/").split("@")[0].lower()  # /1@봇이름 형태도 처리
+    t = text.strip().lstrip("/").split("@")[0].lower()
     if not t:
         return None
     if t.startswith("m") and t[1:].isdigit():
@@ -277,7 +328,6 @@ def handle_command(text, cache):
         send_message(format_message(cache.top7, cache.top30))
         return
 
-    # 숫자/심볼 명령인데 순위 캐시가 없으면 먼저 스캔
     if (cmd.isdigit() or (cmd.startswith("m") and cmd[1:].isdigit())) and not cache.top7:
         send_message("🔄 순위 데이터가 없어 먼저 스캔합니다... (30초~1분)")
         cache.update(*scan())
@@ -290,14 +340,13 @@ def handle_command(text, cache):
     try:
         buf, caption = make_chart(symbol)
         send_photo(buf, caption)
-    except requests.HTTPError:
-        # 정확한 심볼이 없으면 비슷한 이름의 코인을 찾아서 추천
+    except LookupError:
         query = symbol.replace("USDT", "")
         similar = find_similar_symbols(query)
         if similar:
             suggestions = " ".join(f"/{s.lower()}" for s in similar)
             send_message(
-                f"⚠️ '{query}' 코인을 찾을 수 없습니다.\n"
+                f"⚠️ '{query}' 코인을 현물·선물·MEXC 어디에서도 찾을 수 없습니다.\n"
                 f"혹시 이 중에 있나요? 👉 {suggestions}"
             )
         else:
@@ -308,9 +357,8 @@ def handle_command(text, cache):
 
 # ============ 상시 대기 루프 ============
 def listen_loop():
-    """RUN_MINUTES 동안 텔레그램 명령에 응답. GitHub Actions가 5시간마다 교대."""
     cache = RankCache()
-    cache.update(*scan())  # 시작하자마자 순위 준비 (즉답용)
+    cache.update(*scan())  # 시작하자마자 순위 준비
     print(f"🤖 봇 근무 시작 ({RUN_MINUTES}분)")
 
     deadline = time.time() + RUN_MINUTES * 60
@@ -329,7 +377,6 @@ def listen_loop():
             continue
 
         if not r.get("ok"):
-            # 교대 직후 이전 봇과 잠깐 겹치면 409 에러 → 잠시 대기
             print(f"응답 오류: {r.get('description', r)}")
             time.sleep(5)
             continue
@@ -341,7 +388,7 @@ def listen_loop():
             chat_id = str(msg.get("chat", {}).get("id", ""))
             msg_time = msg.get("date", 0)
 
-            if chat_id != str(TELEGRAM_CHAT_ID):  # 본인 채팅만 처리
+            if chat_id != str(TELEGRAM_CHAT_ID):
                 continue
             if not text.startswith("/"):
                 continue
