@@ -1,5 +1,9 @@
 """
-코인 변동성 스크리너 에이전트 v4 (24시간 상시 봇)
+코인 변동성 스크리너 에이전트 v5 (24시간 상시 봇)
+
+v5 변경사항:
+- 순위 스캔에 선물 전용 상장 코인 포함 (현물 + 선물 통합 스캔)
+- 3개월(90일) 변동성 순위 추가
 
 실행 모드:
   python volatility_agent.py scan    → 순위 스캔 후 리스트 1회 발송 (아침 알림용)
@@ -9,12 +13,15 @@
   /show        최신 변동성 순위 리스트
   /1 ~ /10     7일 변동성 순위 코인 차트
   /m1 ~ /m10   30일 변동성 순위 코인 차트
+  /q1 ~ /q10   3개월 변동성 순위 코인 차트
   /심볼        차트 직접 요청 (현물→선물→MEXC 순으로 검색)
+  /심볼 4h     시간봉 지정 (5m 15m 30m 1h 4h 1d 1w)
   /help        명령어 안내
 """
 
 import os
 import io
+import re
 import sys
 import math
 import time
@@ -28,12 +35,14 @@ matplotlib.use("Agg")  # 서버 환경(화면 없음)용 설정
 import mplfinance as mpf
 
 # ============ 설정 ============
-TOP_N = 10                    # 상위 몇 개 코인을 보여줄지
-MIN_VOLUME_USDT = 10_000_000  # 최소 24h 거래대금 필터 (순위 스캔용)
-CHART_DAYS = 60               # 차트에 표시할 최대 일봉 개수
-CACHE_MINUTES = 15            # /show 시 이 시간 내 캐시가 있으면 재사용
+TOP_N = 10                        # 순위당 코인 개수
+MIN_VOLUME_USDT = 10_000_000      # 현물 24h 거래대금 필터
+FUT_ONLY_MIN_VOLUME = 1_000_000   # 선물 전용 코인 필터 (MEXC 거래대금 기준이라 완화)
+SCAN_DAYS = 91                    # 스캔용 일봉 개수 (3개월 계산에 필요)
+CHART_DAYS = 60                   # 차트에 표시할 봉 개수
+CACHE_MINUTES = 15                # /show 시 이 시간 내 캐시가 있으면 재사용
 RUN_MINUTES = int(os.environ.get("RUN_MINUTES", "350"))  # listen 모드 1회 근무 시간
-STALE_MESSAGE_MINUTES = 30    # 이보다 오래된 메시지는 무시
+STALE_MESSAGE_MINUTES = 30        # 이보다 오래된 메시지는 무시
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -48,6 +57,11 @@ KLINE_SOURCES = [
     ("MEXC", "https://api.mexc.com/api/v3/klines"),
 ]
 
+# 지원 시간봉 (바이낸스·MEXC 공통 지원 목록)
+VALID_INTERVALS = ("5m", "15m", "30m", "1h", "4h", "1d", "1w")
+# MEXC는 일부 시간봉 표기가 다름
+MEXC_INTERVAL_MAP = {"1h": "60m", "1w": "1W"}
+
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 KST = timezone(timedelta(hours=9))
 
@@ -56,19 +70,22 @@ HELP_TEXT = (
     "/show — 최신 변동성 순위 리스트\n"
     f"/1 ~ /{TOP_N} — 7일 순위 코인 차트\n"
     f"/m1 ~ /m{TOP_N} — 30일 순위 코인 차트\n"
+    f"/q1 ~ /q{TOP_N} — 3개월 순위 코인 차트\n"
     "/심볼 — 차트 직접 요청 (예: /eth, /lab)\n"
     "     현물에 없으면 선물·MEXC까지 자동 검색\n"
     "뒤에 시간봉을 붙이면 해당 봉 차트 (기본: 일봉)\n"
-    "  예: /eth 4h · /1 1h · /m3 15m\n"
+    "  예: /eth 4h · /1 1h · /q3 15m\n"
     "  지원: 5m 15m 30m 1h 4h 1d 1w\n"
     "/help — 이 안내 보기\n\n"
     "⚡ = 바이낸스 선물 상장 코인 (차트 캡션에도 표시)\n"
+    "순위에는 선물 전용 상장 코인도 포함됩니다.\n"
     "매일 아침 7:30(KST)에 순위가 자동 발송됩니다."
 )
 
 
 # ============ 데이터 수집 ============
 def get_usdt_symbols():
+    """거래대금 필터를 통과한 바이낸스 현물 USDT 페어"""
     r = requests.get(f"{BINANCE_API}/api/v3/ticker/24hr", timeout=15)
     r.raise_for_status()
     symbols = []
@@ -83,7 +100,7 @@ def get_usdt_symbols():
     return symbols
 
 
-def get_daily_klines(symbol, days=31):
+def get_daily_klines(symbol, days=SCAN_DAYS):
     """순위 스캔용 (바이낸스 현물 전용, 빠름)"""
     r = requests.get(
         f"{BINANCE_API}/api/v3/klines",
@@ -94,14 +111,8 @@ def get_daily_klines(symbol, days=31):
     return r.json()
 
 
-# 지원 시간봉 (바이낸스·MEXC 공통 지원 목록)
-VALID_INTERVALS = ("5m", "15m", "30m", "1h", "4h", "1d", "1w")
-# MEXC는 일부 시간봉 표기가 다름
-MEXC_INTERVAL_MAP = {"1h": "60m", "1w": "1W"}
-
-
 def get_klines_any(symbol, interval="1d", limit=CHART_DAYS):
-    """차트용: 현물 → 선물 → MEXC 순으로 시도. 성공 시 (봉데이터, 소스이름) 반환"""
+    """현물 → 선물 → MEXC 순으로 시도. 성공 시 (봉데이터, 소스이름) 반환"""
     for source_name, url in KLINE_SOURCES:
         iv = interval
         if source_name == "MEXC":
@@ -122,11 +133,6 @@ def get_klines_any(symbol, interval="1d", limit=CHART_DAYS):
     raise LookupError(symbol)
 
 
-def get_daily_klines_any(symbol, days=CHART_DAYS):
-    """(하위 호환) 일봉 조회"""
-    return get_klines_any(symbol, "1d", days)
-
-
 def calc_volatility(klines, period):
     """데이터가 period일보다 적으면 None 반환 (신규 상장 코인)"""
     k = klines[-period:]
@@ -145,36 +151,7 @@ def calc_volatility(klines, period):
     }
 
 
-def _scan_one(sym):
-    klines = get_daily_klines(sym, days=31)
-    v7 = calc_volatility(klines, 7)
-    v30 = calc_volatility(klines, 30)
-    if v7 and v30:
-        return {"symbol": sym, "v7": v7, "v30": v30}
-    return None
-
-
-def scan():
-    symbols = get_usdt_symbols()
-    print(f"스캔 대상: {len(symbols)}개 코인")
-    results = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(_scan_one, s): s for s in symbols}
-        for i, fut in enumerate(as_completed(futures)):
-            try:
-                r = fut.result()
-                if r:
-                    results.append(r)
-            except Exception as e:
-                print(f"  {futures[fut]} 실패: {e}")
-            if (i + 1) % 100 == 0:
-                print(f"  진행: {i + 1}/{len(symbols)}")
-    top7 = sorted(results, key=lambda x: x["v7"]["std_vol"], reverse=True)[:TOP_N]
-    top30 = sorted(results, key=lambda x: x["v30"]["std_vol"], reverse=True)[:TOP_N]
-    return annotate_futures(top7, top30)
-
-
-# ============ 바이낸스 선물 상장 확인 ============
+# ============ 바이낸스 선물 유니버스 ============
 _futures_symbols = None
 _futures_checked = False
 
@@ -200,11 +177,62 @@ def get_binance_futures_symbols():
     return _futures_symbols
 
 
+def list_futures_symbols_from_vision():
+    """data.binance.vision 저장소 폴더 목록에서 선물 심볼 추출 (지역 차단 없음)
+    주의: 상장폐지된 심볼도 포함될 수 있음 → 거래대금/최신봉 검증으로 걸러냄"""
+    base = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
+    prefix = "data/futures/um/daily/klines/"
+    symbols, marker = [], ""
+    for _ in range(10):  # 페이지네이션 안전 상한
+        url = f"{base}?delimiter=/&prefix={prefix}"
+        if marker:
+            url += f"&marker={marker}"
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        found = re.findall(
+            r"<Prefix>data/futures/um/daily/klines/([^/<]+)/</Prefix>", r.text
+        )
+        symbols += found
+        if "<IsTruncated>true</IsTruncated>" in r.text and found:
+            marker = f"{prefix}{found[-1]}/"
+        else:
+            break
+    usdt = [s for s in symbols if s.endswith("USDT")]
+    print(f"선물 심볼 목록 확보: {len(usdt)}개 (data.binance.vision)")
+    return usdt
+
+
+def get_futures_universe():
+    """선물 상장 심볼 → 24h 거래대금 딕셔너리
+    1순위: fapi ticker (정확한 선물 거래대금)
+    2순위: 저장소 목록 + MEXC 거래대금 (fapi 차단 시)"""
+    try:
+        r = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
+        if r.status_code == 200:
+            return {
+                t["symbol"]: float(t.get("quoteVolume", 0))
+                for t in r.json()
+                if t["symbol"].endswith("USDT")
+            }, MIN_VOLUME_USDT
+    except Exception as e:
+        print(f"fapi ticker 접속 불가: {e}")
+
+    # 폴백: 저장소 목록 + MEXC 거래대금
+    syms = list_futures_symbols_from_vision()
+    mexc_vol = {}
+    try:
+        r = requests.get("https://api.mexc.com/api/v3/ticker/24hr", timeout=20)
+        if r.status_code == 200:
+            mexc_vol = {
+                t["symbol"]: float(t.get("quoteVolume", 0) or 0) for t in r.json()
+            }
+    except Exception as e:
+        print(f"MEXC ticker 조회 실패: {e}")
+    return {s: mexc_vol.get(s, 0.0) for s in syms}, FUT_ONLY_MIN_VOLUME
+
+
 def is_binance_futures_listed(symbol):
-    """바이낸스 선물(무기한) 상장·거래 중인지 확인
-    1순위: fapi exchangeInfo (정확, 지역 차단 가능)
-    2순위: data.binance.vision에 어제/그제 데이터 파일 존재 여부 (차단 없음, 하루 지연)
-    """
+    """바이낸스 선물(무기한) 상장·거래 중인지 확인"""
     fs = get_binance_futures_symbols()
     if fs is not None:
         return symbol in fs
@@ -222,21 +250,101 @@ def is_binance_futures_listed(symbol):
     return False
 
 
-def annotate_futures(top7, top30):
-    """순위 리스트의 각 코인에 선물 상장 여부(fut) 표시 (병렬 확인)"""
-    union = {r["symbol"] for r in top7} | {r["symbol"] for r in top30}
-    listed = {}
-    get_binance_futures_symbols()  # fapi 가능 여부 먼저 1회 확인
+def annotate_futures(*lists):
+    """각 순위 리스트의 코인에 선물 상장 여부(fut) 표시. 이미 표시된 코인은 건너뜀"""
+    union = {r["symbol"] for lst in lists for r in lst if "fut" not in r}
+    if union:
+        listed = {}
+        get_binance_futures_symbols()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = {pool.submit(is_binance_futures_listed, s): s for s in union}
+            for f in as_completed(futs):
+                try:
+                    listed[futs[f]] = f.result()
+                except Exception:
+                    listed[futs[f]] = False
+        for lst in lists:
+            for r in lst:
+                if "fut" not in r:
+                    r["fut"] = listed.get(r["symbol"], False)
+    return lists
+
+
+# ============ 통합 스캔 (현물 + 선물 전용) ============
+def _build_entry(sym, klines):
+    """일봉 → 순위 항목. 최신 봉이 3일 이상 오래됐으면 제외 (상장폐지 대비)"""
+    if not klines:
+        return None
+    last_open_ms = float(klines[-1][0])
+    if time.time() * 1000 - last_open_ms > 3 * 86400 * 1000:
+        return None
+    v7 = calc_volatility(klines, 7)
+    if not v7:
+        return None  # 일봉 7개 미만은 순위 제외
+    return {
+        "symbol": sym,
+        "v7": v7,
+        "v30": calc_volatility(klines, 30),
+        "v90": calc_volatility(klines, 90),
+    }
+
+
+def _scan_one_spot(sym):
+    return _build_entry(sym, get_daily_klines(sym, SCAN_DAYS))
+
+
+def _scan_one_futonly(sym):
+    """선물 전용 코인: 선물 API → MEXC 폴백으로 일봉 조회"""
+    klines, _ = get_klines_any(sym, "1d", SCAN_DAYS)
+    entry = _build_entry(sym, klines)
+    if entry:
+        entry["fut"] = True  # 선물 전용 = 당연히 선물 상장
+        entry["fut_only"] = True
+    return entry
+
+
+def _top_by(results, key):
+    pool = [r for r in results if r.get(key)]
+    return sorted(pool, key=lambda x: x[key]["std_vol"], reverse=True)[:TOP_N]
+
+
+def scan():
+    # 1) 현물 유니버스
+    spot_symbols = get_usdt_symbols()
+    spot_set = set(spot_symbols)
+
+    # 2) 선물 유니버스에서 '선물 전용' 코인 추출
+    fut_only = []
+    try:
+        fut_universe, fut_min_vol = get_futures_universe()
+        fut_only = [
+            s for s, vol in fut_universe.items()
+            if s not in spot_set and vol >= fut_min_vol
+        ]
+    except Exception as e:
+        print(f"선물 유니버스 조회 실패 (현물만 스캔): {e}")
+
+    print(f"스캔 대상: 현물 {len(spot_symbols)}개 + 선물 전용 {len(fut_only)}개")
+
+    results = []
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futs = {pool.submit(is_binance_futures_listed, s): s for s in union}
-        for f in as_completed(futs):
+        futures = {pool.submit(_scan_one_spot, s): s for s in spot_symbols}
+        futures.update({pool.submit(_scan_one_futonly, s): s for s in fut_only})
+        for i, fut in enumerate(as_completed(futures)):
             try:
-                listed[futs[f]] = f.result()
+                r = fut.result()
+                if r:
+                    results.append(r)
             except Exception:
-                listed[futs[f]] = False
-    for r in top7 + top30:
-        r["fut"] = listed.get(r["symbol"], False)
-    return top7, top30
+                pass
+            if (i + 1) % 100 == 0:
+                print(f"  진행: {i + 1}/{len(futures)}")
+
+    top7 = _top_by(results, "v7")
+    top30 = _top_by(results, "v30")
+    top90 = _top_by(results, "v90")
+    annotate_futures(top7, top30, top90)
+    return top7, top30, top90
 
 
 # ============ 유사 심볼 검색 ============
@@ -319,11 +427,11 @@ def make_chart(symbol, interval="1d"):
     fut_mark = "✅ 상장" if is_binance_futures_listed(symbol) else "❌ 미상장"
 
     if interval == "1d":
-        v7 = calc_volatility(klines, 7)
-        v30 = calc_volatility(klines, 30)
-        stat_lines = f"{_fmt_vol_line('7일', v7)}\n{_fmt_vol_line('30일', v30)}"
+        stat_lines = (
+            f"{_fmt_vol_line('7일', calc_volatility(klines, 7))}\n"
+            f"{_fmt_vol_line('30일', calc_volatility(klines, 30))}"
+        )
     else:
-        # 시간봉: 표시된 구간 전체의 레인지/변동률
         closes = [float(c[4]) for c in klines]
         highs = [float(c[2]) for c in klines]
         lows = [float(c[3]) for c in klines]
@@ -365,32 +473,31 @@ def send_photo(photo_buf, caption):
     r.raise_for_status()
 
 
-def format_message(top7, top30):
+def _format_section(title, entries, vkey):
+    lines = [f"📊 <b>{title}</b>"]
+    for i, r in enumerate(entries, 1):
+        name = r["symbol"].replace("USDT", "")
+        fut = "⚡" if r.get("fut") else ""
+        v = r[vkey]
+        arrow = "🟢" if v["change_pct"] >= 0 else "🔴"
+        lines.append(
+            f"{i}. <b>{name}</b>{fut} | 일변동 {v['std_vol']:.1f}% | "
+            f"레인지 {v['range_pct']:.0f}% | {arrow} {v['change_pct']:+.1f}%"
+        )
+    return lines
+
+
+def format_message(top7, top30, top90):
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     lines = [f"🔥 <b>변동성 스크리너</b> ({now} KST)\n"]
-    lines.append(f"📊 <b>7일 변동성 TOP {TOP_N}</b>")
-    for i, r in enumerate(top7, 1):
-        name = r["symbol"].replace("USDT", "")
-        fut = "⚡" if r.get("fut") else ""
-        v = r["v7"]
-        arrow = "🟢" if v["change_pct"] >= 0 else "🔴"
-        lines.append(
-            f"{i}. <b>{name}</b>{fut} | 일변동 {v['std_vol']:.1f}% | "
-            f"레인지 {v['range_pct']:.0f}% | {arrow} {v['change_pct']:+.1f}%"
-        )
-    lines.append(f"\n📊 <b>30일 변동성 TOP {TOP_N}</b>")
-    for i, r in enumerate(top30, 1):
-        name = r["symbol"].replace("USDT", "")
-        fut = "⚡" if r.get("fut") else ""
-        v = r["v30"]
-        arrow = "🟢" if v["change_pct"] >= 0 else "🔴"
-        lines.append(
-            f"{i}. <b>{name}</b>{fut} | 일변동 {v['std_vol']:.1f}% | "
-            f"레인지 {v['range_pct']:.0f}% | {arrow} {v['change_pct']:+.1f}%"
-        )
+    lines += _format_section(f"7일 변동성 TOP {TOP_N}", top7, "v7")
+    lines.append("")
+    lines += _format_section(f"30일 변동성 TOP {TOP_N}", top30, "v30")
+    lines.append("")
+    lines += _format_section(f"3개월 변동성 TOP {TOP_N}", top90, "v90")
     lines.append(
-        f"\n⚡ = 바이낸스 선물 상장\n"
-        f"💬 /1 ~ /{TOP_N} 차트 | /m1 ~ /m{TOP_N} 30일 차트 | /help 도움말"
+        f"\n⚡ = 바이낸스 선물 상장 (선물 전용 코인 포함)\n"
+        f"💬 /1~/{TOP_N} 7일 | /m1~/m{TOP_N} 30일 | /q1~/q{TOP_N} 3개월 | /help"
     )
     return "\n".join(lines)
 
@@ -398,26 +505,36 @@ def format_message(top7, top30):
 # ============ 명령 처리 ============
 class RankCache:
     def __init__(self):
-        self.top7, self.top30, self.ts = [], [], 0.0
+        self.top7, self.top30, self.top90, self.ts = [], [], [], 0.0
 
     def is_fresh(self):
         return self.top7 and (time.time() - self.ts) < CACHE_MINUTES * 60
 
-    def update(self, top7, top30):
-        self.top7, self.top30, self.ts = top7, top30, time.time()
+    def update(self, top7, top30, top90):
+        self.top7, self.top30, self.top90 = top7, top30, top90
+        self.ts = time.time()
 
 
-def parse_command(text, cache):
-    t = text.strip().lstrip("/").split("@")[0].lower()
+def parse_command(token, cache):
+    """'/1' → 7일 1위, '/m3' → 30일 3위, '/q2' → 3개월 2위, '/tlm' → TLMUSDT"""
+    t = token.strip().lstrip("/").split("@")[0].lower()
     if not t:
         return None
-    if t.startswith("m") and t[1:].isdigit():
-        idx = int(t[1:]) - 1
-        return cache.top30[idx]["symbol"] if 0 <= idx < len(cache.top30) else None
+    for prefix, lst in (("m", cache.top30), ("q", cache.top90)):
+        if t.startswith(prefix) and t[1:].isdigit():
+            idx = int(t[1:]) - 1
+            return lst[idx]["symbol"] if 0 <= idx < len(lst) else None
     if t.isdigit():
         idx = int(t) - 1
         return cache.top7[idx]["symbol"] if 0 <= idx < len(cache.top7) else None
     return t.upper() + "USDT" if not t.upper().endswith("USDT") else t.upper()
+
+
+def _is_rank_command(cmd):
+    return (
+        cmd.isdigit()
+        or (cmd[:1] in ("m", "q") and cmd[1:].isdigit())
+    )
 
 
 def handle_command(text, cache):
@@ -433,9 +550,9 @@ def handle_command(text, cache):
 
     if cmd == "show":
         if not cache.is_fresh():
-            send_message("🔄 최신 데이터 스캔 중... (30초~1분)")
+            send_message("🔄 최신 데이터 스캔 중... (1~2분)")
             cache.update(*scan())
-        send_message(format_message(cache.top7, cache.top30))
+        send_message(format_message(cache.top7, cache.top30, cache.top90))
         return
 
     if interval not in VALID_INTERVALS:
@@ -445,8 +562,8 @@ def handle_command(text, cache):
         )
         return
 
-    if (cmd.isdigit() or (cmd.startswith("m") and cmd[1:].isdigit())) and not cache.top7:
-        send_message("🔄 순위 데이터가 없어 먼저 스캔합니다... (30초~1분)")
+    if _is_rank_command(cmd) and not cache.top7:
+        send_message("🔄 순위 데이터가 없어 먼저 스캔합니다... (1~2분)")
         cache.update(*scan())
 
     symbol = parse_command(first, cache)
@@ -527,5 +644,5 @@ if __name__ == "__main__":
     if mode == "listen":
         listen_loop()
     else:
-        top7, top30 = scan()
-        send_message(format_message(top7, top30))
+        top7, top30, top90 = scan()
+        send_message(format_message(top7, top30, top90))
