@@ -1,9 +1,10 @@
 """
-코인 변동성 스크리너 에이전트 v5 (24시간 상시 봇)
+코인 변동성 스크리너 에이전트 v6 (24시간 상시 봇)
 
-v5 변경사항:
-- 순위 스캔에 선물 전용 상장 코인 포함 (현물 + 선물 통합 스캔)
-- 3개월(90일) 변동성 순위 추가
+v6 변경사항:
+- 스캔 기준을 'MEXC 선물(무기한) 전체'로 변경 (바이낸스 상장 여부와 무관)
+- 각 코인이 바이낸스 선물(🅱) / OKX 선물(🅾)에서 거래 가능한지 표시
+- 차트 데이터 소스에 MEXC 선물 추가 (MEXC 선물 전용 코인도 차트 지원)
 
 실행 모드:
   python volatility_agent.py scan    → 순위 스캔 후 리스트 1회 발송 (아침 알림용)
@@ -14,7 +15,7 @@ v5 변경사항:
   /1 ~ /10     7일 변동성 순위 코인 차트
   /m1 ~ /m10   30일 변동성 순위 코인 차트
   /q1 ~ /q10   3개월 변동성 순위 코인 차트
-  /심볼        차트 직접 요청 (현물→선물→MEXC 순으로 검색)
+  /심볼        차트 직접 요청 (바이낸스 현물→선물→MEXC 현물→MEXC 선물 순으로 검색)
   /심볼 4h     시간봉 지정 (5m 15m 30m 1h 4h 1d 1w)
   /help        명령어 안내
 """
@@ -36,31 +37,31 @@ import mplfinance as mpf
 
 # ============ 설정 ============
 TOP_N = 10                        # 순위당 코인 개수
-MIN_VOLUME_USDT = 10_000_000      # 현물 24h 거래대금 필터
-FUT_ONLY_MIN_VOLUME = 1_000_000   # 선물 전용 코인 필터 (MEXC 거래대금 기준이라 완화)
+MEXC_MIN_VOLUME = 1_000_000       # MEXC 선물 24h 거래대금(USDT) 필터 — 낮추면 더 많은 코인 스캔
 SCAN_DAYS = 91                    # 스캔용 일봉 개수 (3개월 계산에 필요)
 CHART_DAYS = 60                   # 차트에 표시할 봉 개수
 CACHE_MINUTES = 15                # /show 시 이 시간 내 캐시가 있으면 재사용
 RUN_MINUTES = int(os.environ.get("RUN_MINUTES", "350"))  # listen 모드 1회 근무 시간
 STALE_MESSAGE_MINUTES = 30        # 이보다 오래된 메시지는 무시
+SCAN_WORKERS = 6                  # 동시 요청 수 (MEXC 레이트리밋 고려)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# 순위 스캔용 기본 소스 (GitHub Actions에서 접속 가능한 바이낸스 현물 공개 데이터)
 BINANCE_API = "https://data-api.binance.vision"
+MEXC_CONTRACT_API = "https://contract.mexc.com/api/v1/contract"
 
-# 차트용 데이터 소스 (순서대로 시도)
-KLINE_SOURCES = [
-    ("Binance Spot", f"{BINANCE_API}/api/v3/klines"),
-    ("Binance Futures", "https://fapi.binance.com/fapi/v1/klines"),
-    ("MEXC", "https://api.mexc.com/api/v3/klines"),
-]
-
-# 지원 시간봉 (바이낸스·MEXC 공통 지원 목록)
+# 지원 시간봉
 VALID_INTERVALS = ("5m", "15m", "30m", "1h", "4h", "1d", "1w")
-# MEXC는 일부 시간봉 표기가 다름
-MEXC_INTERVAL_MAP = {"1h": "60m", "1w": "1W"}
+MEXC_SPOT_INTERVAL_MAP = {"1h": "60m", "1w": "1W"}
+MEXC_FUT_INTERVAL_MAP = {
+    "5m": "Min5", "15m": "Min15", "30m": "Min30",
+    "1h": "Min60", "4h": "Hour4", "1d": "Day1", "1w": "Week1",
+}
+INTERVAL_SECONDS = {
+    "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800,
+}
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 KST = timezone(timedelta(hours=9))
@@ -72,65 +73,51 @@ HELP_TEXT = (
     f"/m1 ~ /m{TOP_N} — 30일 순위 코인 차트\n"
     f"/q1 ~ /q{TOP_N} — 3개월 순위 코인 차트\n"
     "/심볼 — 차트 직접 요청 (예: /eth, /lab)\n"
-    "     현물에 없으면 선물·MEXC까지 자동 검색\n"
+    "     바이낸스→MEXC 현물→MEXC 선물 순 자동 검색\n"
     "뒤에 시간봉을 붙이면 해당 봉 차트 (기본: 일봉)\n"
     "  예: /eth 4h · /1 1h · /q3 15m\n"
     "  지원: 5m 15m 30m 1h 4h 1d 1w\n"
     "/help — 이 안내 보기\n\n"
-    "⚡ = 바이낸스 선물 상장 코인 (차트 캡션에도 표시)\n"
-    "순위에는 선물 전용 상장 코인도 포함됩니다.\n"
+    "📌 순위는 <b>MEXC 선물 전체</b>를 스캔한 결과입니다.\n"
+    "🅱 = 바이낸스 선물 거래 가능 · 🅾 = OKX 선물 거래 가능\n"
     "매일 아침 7:30(KST)에 순위가 자동 발송됩니다."
 )
 
 
-# ============ 데이터 수집 ============
-def get_usdt_symbols():
-    """거래대금 필터를 통과한 바이낸스 현물 USDT 페어"""
-    r = requests.get(f"{BINANCE_API}/api/v3/ticker/24hr", timeout=15)
+# ============ MEXC 선물 데이터 수집 ============
+def get_mexc_futures_universe():
+    """MEXC 선물 전체 심볼 → 24h 거래대금(USDT) 딕셔너리. 심볼 형식: BTC_USDT"""
+    r = requests.get(f"{MEXC_CONTRACT_API}/ticker", timeout=20)
     r.raise_for_status()
-    symbols = []
-    for t in r.json():
-        s = t["symbol"]
-        if not s.endswith("USDT"):
-            continue
-        if any(x in s for x in ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
-            continue
-        if float(t["quoteVolume"]) >= MIN_VOLUME_USDT:
-            symbols.append(s)
-    return symbols
+    data = r.json().get("data", []) or []
+    return {
+        t["symbol"]: float(t.get("amount24", 0) or 0)
+        for t in data
+        if t.get("symbol", "").endswith("_USDT")
+    }
 
 
-def get_daily_klines(symbol, days=SCAN_DAYS):
-    """순위 스캔용 (바이낸스 현물 전용, 빠름)"""
+def get_mexc_futures_klines(symbol_u, interval="1d", limit=SCAN_DAYS):
+    """MEXC 선물 봉데이터. symbol_u는 언더스코어 형식(BTC_USDT).
+    반환: [시간ms, 시가, 고가, 저가, 종가, 거래량] 리스트 (다른 소스와 동일 형식)"""
+    iv = MEXC_FUT_INTERVAL_MAP[interval]
+    end = int(time.time())
+    start = end - (limit + 2) * INTERVAL_SECONDS[interval]
     r = requests.get(
-        f"{BINANCE_API}/api/v3/klines",
-        params={"symbol": symbol, "interval": "1d", "limit": days},
+        f"{MEXC_CONTRACT_API}/kline/{symbol_u}",
+        params={"interval": iv, "start": start, "end": end},
         timeout=15,
     )
     r.raise_for_status()
-    return r.json()
-
-
-def get_klines_any(symbol, interval="1d", limit=CHART_DAYS):
-    """현물 → 선물 → MEXC 순으로 시도. 성공 시 (봉데이터, 소스이름) 반환"""
-    for source_name, url in KLINE_SOURCES:
-        iv = interval
-        if source_name == "MEXC":
-            iv = MEXC_INTERVAL_MAP.get(interval, interval)
-        try:
-            r = requests.get(
-                url,
-                params={"symbol": symbol, "interval": iv, "limit": limit},
-                timeout=15,
-            )
-            if r.status_code != 200:
-                continue
-            k = r.json()
-            if isinstance(k, list) and len(k) >= 2:
-                return k, source_name
-        except Exception as e:
-            print(f"  {source_name} 조회 실패({symbol} {interval}): {e}")
-    raise LookupError(symbol)
+    d = r.json().get("data") or {}
+    times = d.get("time") or []
+    if not times:
+        return []
+    rows = [
+        [times[i] * 1000, d["open"][i], d["high"][i], d["low"][i], d["close"][i], d["vol"][i]]
+        for i in range(len(times))
+    ]
+    return rows[-limit:]
 
 
 def calc_volatility(klines, period):
@@ -151,13 +138,13 @@ def calc_volatility(klines, period):
     }
 
 
-# ============ 바이낸스 선물 유니버스 ============
+# ============ 바이낸스 / OKX 선물 상장 여부 ============
 _futures_symbols = None
 _futures_checked = False
 
 
 def get_binance_futures_symbols():
-    """선물 상장 심볼 전체 목록 (fapi 접속 가능할 때). 차단 시 None"""
+    """바이낸스 선물(무기한) 상장 심볼 전체 목록. fapi 차단 시 None"""
     global _futures_symbols, _futures_checked
     if _futures_checked:
         return _futures_symbols
@@ -171,71 +158,18 @@ def get_binance_futures_symbols():
                 if s.get("status") == "TRADING"
                 and s.get("contractType") == "PERPETUAL"
             }
-            print(f"선물 상장 목록 확보: {len(_futures_symbols)}개 (fapi)")
+            print(f"바이낸스 선물 목록 확보: {len(_futures_symbols)}개 (fapi)")
     except Exception as e:
         print(f"fapi 접속 불가 → 데이터 저장소 방식으로 확인: {e}")
     return _futures_symbols
 
 
-def list_futures_symbols_from_vision():
-    """data.binance.vision 저장소 폴더 목록에서 선물 심볼 추출 (지역 차단 없음)
-    주의: 상장폐지된 심볼도 포함될 수 있음 → 거래대금/최신봉 검증으로 걸러냄"""
-    base = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
-    prefix = "data/futures/um/daily/klines/"
-    symbols, marker = [], ""
-    for _ in range(10):  # 페이지네이션 안전 상한
-        url = f"{base}?delimiter=/&prefix={prefix}"
-        if marker:
-            url += f"&marker={marker}"
-        r = requests.get(url, timeout=20)
-        r.raise_for_status()
-        found = re.findall(
-            r"<Prefix>data/futures/um/daily/klines/([^/<]+)/</Prefix>", r.text
-        )
-        symbols += found
-        if "<IsTruncated>true</IsTruncated>" in r.text and found:
-            marker = f"{prefix}{found[-1]}/"
-        else:
-            break
-    usdt = [s for s in symbols if s.endswith("USDT")]
-    print(f"선물 심볼 목록 확보: {len(usdt)}개 (data.binance.vision)")
-    return usdt
-
-
-def get_futures_universe():
-    """선물 상장 심볼 → 24h 거래대금 딕셔너리
-    1순위: fapi ticker (정확한 선물 거래대금)
-    2순위: 저장소 목록 + MEXC 거래대금 (fapi 차단 시)"""
-    try:
-        r = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
-        if r.status_code == 200:
-            return {
-                t["symbol"]: float(t.get("quoteVolume", 0))
-                for t in r.json()
-                if t["symbol"].endswith("USDT")
-            }, MIN_VOLUME_USDT
-    except Exception as e:
-        print(f"fapi ticker 접속 불가: {e}")
-
-    # 폴백: 저장소 목록 + MEXC 거래대금
-    syms = list_futures_symbols_from_vision()
-    mexc_vol = {}
-    try:
-        r = requests.get("https://api.mexc.com/api/v3/ticker/24hr", timeout=20)
-        if r.status_code == 200:
-            mexc_vol = {
-                t["symbol"]: float(t.get("quoteVolume", 0) or 0) for t in r.json()
-            }
-    except Exception as e:
-        print(f"MEXC ticker 조회 실패: {e}")
-    return {s: mexc_vol.get(s, 0.0) for s in syms}, FUT_ONLY_MIN_VOLUME
-
-
 def is_binance_futures_listed(symbol):
-    """바이낸스 선물(무기한) 상장·거래 중인지 확인"""
+    """바이낸스 선물(무기한) 상장·거래 중인지 확인. symbol 형식: BTCUSDT"""
     fs = get_binance_futures_symbols()
     if fs is not None:
         return symbol in fs
+    # fapi 차단 시 폴백: 공개 데이터 저장소에 최근 일봉 파일이 있는지 확인
     for d in (1, 2):
         date = (datetime.now(timezone.utc) - timedelta(days=d)).strftime("%Y-%m-%d")
         url = (
@@ -250,12 +184,40 @@ def is_binance_futures_listed(symbol):
     return False
 
 
-def annotate_futures(*lists):
-    """각 순위 리스트의 코인에 선물 상장 여부(fut) 표시. 이미 표시된 코인은 건너뜀"""
+_okx_symbols = None
+
+
+def get_okx_futures_symbols():
+    """OKX USDT 무기한 스왑 상장 심볼 집합. 형식은 BTCUSDT로 변환해서 반환"""
+    global _okx_symbols
+    if _okx_symbols is not None:
+        return _okx_symbols
+    try:
+        r = requests.get(
+            "https://www.okx.com/api/v5/public/instruments",
+            params={"instType": "SWAP"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        _okx_symbols = {
+            i["instId"].replace("-USDT-SWAP", "") + "USDT"
+            for i in r.json().get("data", [])
+            if i.get("instId", "").endswith("-USDT-SWAP") and i.get("state") == "live"
+        }
+        print(f"OKX 선물 목록 확보: {len(_okx_symbols)}개")
+    except Exception as e:
+        print(f"OKX 목록 조회 실패: {e}")
+        _okx_symbols = set()
+    return _okx_symbols
+
+
+def annotate_exchanges(*lists):
+    """각 순위 리스트 코인에 바이낸스(fut)·OKX(okx) 선물 가능 여부 표시"""
+    okx = get_okx_futures_symbols()
     union = {r["symbol"] for lst in lists for r in lst if "fut" not in r}
+    listed = {}
     if union:
-        listed = {}
-        get_binance_futures_symbols()
+        get_binance_futures_symbols()  # 목록 캐싱 (있으면 스레드 작업이 즉시 끝남)
         with ThreadPoolExecutor(max_workers=8) as pool:
             futs = {pool.submit(is_binance_futures_listed, s): s for s in union}
             for f in as_completed(futs):
@@ -263,16 +225,17 @@ def annotate_futures(*lists):
                     listed[futs[f]] = f.result()
                 except Exception:
                     listed[futs[f]] = False
-        for lst in lists:
-            for r in lst:
-                if "fut" not in r:
-                    r["fut"] = listed.get(r["symbol"], False)
+    for lst in lists:
+        for r in lst:
+            if "fut" not in r:
+                r["fut"] = listed.get(r["symbol"], False)
+            r["okx"] = r["symbol"] in okx
     return lists
 
 
-# ============ 통합 스캔 (현물 + 선물 전용) ============
-def _build_entry(sym, klines):
-    """일봉 → 순위 항목. 최신 봉이 3일 이상 오래됐으면 제외 (상장폐지 대비)"""
+# ============ 스캔 (MEXC 선물 전체) ============
+def _build_entry(sym, sym_u, klines):
+    """일봉 → 순위 항목. 최신 봉이 3일 이상 오래됐으면 제외 (거래 중단 대비)"""
     if not klines:
         return None
     last_open_ms = float(klines[-1][0])
@@ -282,25 +245,25 @@ def _build_entry(sym, klines):
     if not v7:
         return None  # 일봉 7개 미만은 순위 제외
     return {
-        "symbol": sym,
+        "symbol": sym,       # BTCUSDT (표시·거래소 확인용)
+        "symbol_u": sym_u,   # BTC_USDT (MEXC 선물 조회용)
         "v7": v7,
         "v30": calc_volatility(klines, 30),
         "v90": calc_volatility(klines, 90),
     }
 
 
-def _scan_one_spot(sym):
-    return _build_entry(sym, get_daily_klines(sym, SCAN_DAYS))
-
-
-def _scan_one_futonly(sym):
-    """선물 전용 코인: 선물 API → MEXC 폴백으로 일봉 조회"""
-    klines, _ = get_klines_any(sym, "1d", SCAN_DAYS)
-    entry = _build_entry(sym, klines)
-    if entry:
-        entry["fut"] = True  # 선물 전용 = 당연히 선물 상장
-        entry["fut_only"] = True
-    return entry
+def _scan_one(sym_u):
+    for attempt in (1, 2):  # 레이트리밋 대비 1회 재시도
+        try:
+            klines = get_mexc_futures_klines(sym_u, "1d", SCAN_DAYS)
+            return _build_entry(sym_u.replace("_", ""), sym_u, klines)
+        except Exception:
+            if attempt == 1:
+                time.sleep(1.5)
+            else:
+                raise
+    return None
 
 
 def _top_by(results, key):
@@ -309,27 +272,13 @@ def _top_by(results, key):
 
 
 def scan():
-    # 1) 현물 유니버스
-    spot_symbols = get_usdt_symbols()
-    spot_set = set(spot_symbols)
-
-    # 2) 선물 유니버스에서 '선물 전용' 코인 추출
-    fut_only = []
-    try:
-        fut_universe, fut_min_vol = get_futures_universe()
-        fut_only = [
-            s for s, vol in fut_universe.items()
-            if s not in spot_set and vol >= fut_min_vol
-        ]
-    except Exception as e:
-        print(f"선물 유니버스 조회 실패 (현물만 스캔): {e}")
-
-    print(f"스캔 대상: 현물 {len(spot_symbols)}개 + 선물 전용 {len(fut_only)}개")
+    universe = get_mexc_futures_universe()
+    targets = [s for s, vol in universe.items() if vol >= MEXC_MIN_VOLUME]
+    print(f"MEXC 선물 전체 {len(universe)}개 중 거래대금 필터 통과: {len(targets)}개")
 
     results = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(_scan_one_spot, s): s for s in spot_symbols}
-        futures.update({pool.submit(_scan_one_futonly, s): s for s in fut_only})
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+        futures = {pool.submit(_scan_one, s): s for s in targets}
         for i, fut in enumerate(as_completed(futures)):
             try:
                 r = fut.result()
@@ -343,20 +292,74 @@ def scan():
     top7 = _top_by(results, "v7")
     top30 = _top_by(results, "v30")
     top90 = _top_by(results, "v90")
-    annotate_futures(top7, top30, top90)
+    annotate_exchanges(top7, top30, top90)
     return top7, top30, top90
+
+
+# ============ 차트용 데이터 소스 (순서대로 시도) ============
+def _fetch_binance_spot(symbol, interval, limit):
+    r = requests.get(
+        f"{BINANCE_API}/api/v3/klines",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+        timeout=15,
+    )
+    return r.json() if r.status_code == 200 else None
+
+
+def _fetch_binance_fut(symbol, interval, limit):
+    r = requests.get(
+        "https://fapi.binance.com/fapi/v1/klines",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+        timeout=15,
+    )
+    return r.json() if r.status_code == 200 else None
+
+
+def _fetch_mexc_spot(symbol, interval, limit):
+    iv = MEXC_SPOT_INTERVAL_MAP.get(interval, interval)
+    r = requests.get(
+        "https://api.mexc.com/api/v3/klines",
+        params={"symbol": symbol, "interval": iv, "limit": limit},
+        timeout=15,
+    )
+    return r.json() if r.status_code == 200 else None
+
+
+def _fetch_mexc_fut(symbol, interval, limit):
+    sym_u = symbol[:-4] + "_USDT" if symbol.endswith("USDT") else symbol
+    return get_mexc_futures_klines(sym_u, interval, limit)
+
+
+KLINE_SOURCES = [
+    ("Binance Spot", _fetch_binance_spot),
+    ("Binance Futures", _fetch_binance_fut),
+    ("MEXC Spot", _fetch_mexc_spot),
+    ("MEXC Futures", _fetch_mexc_fut),
+]
+
+
+def get_klines_any(symbol, interval="1d", limit=CHART_DAYS):
+    """바이낸스 현물 → 선물 → MEXC 현물 → MEXC 선물 순으로 시도"""
+    for source_name, fetch in KLINE_SOURCES:
+        try:
+            k = fetch(symbol, interval, limit)
+            if isinstance(k, list) and len(k) >= 2:
+                return k, source_name
+        except Exception as e:
+            print(f"  {source_name} 조회 실패({symbol} {interval}): {e}")
+    raise LookupError(symbol)
 
 
 # ============ 유사 심볼 검색 ============
 def find_similar_symbols(query, limit=5):
-    """현물+선물+MEXC 전체에서 query가 포함된 심볼 검색"""
-    sources = [
+    """바이낸스 현물·선물 + MEXC 현물·선물 전체에서 query가 포함된 심볼 검색"""
+    found = set()
+    rest_sources = [
         f"{BINANCE_API}/api/v3/exchangeInfo",
         "https://fapi.binance.com/fapi/v1/exchangeInfo",
         "https://api.mexc.com/api/v3/exchangeInfo",
     ]
-    found = set()
-    for url in sources:
+    for url in rest_sources:
         try:
             r = requests.get(url, timeout=20)
             if r.status_code != 200:
@@ -373,6 +376,14 @@ def find_similar_symbols(query, limit=5):
                     found.add(base)
         except Exception as e:
             print(f"유사 심볼 검색 실패({url}): {e}")
+    # MEXC 선물 유니버스에서도 검색
+    try:
+        for sym_u in get_mexc_futures_universe():
+            base = sym_u.replace("_USDT", "")
+            if query in base:
+                found.add(base)
+    except Exception as e:
+        print(f"MEXC 선물 심볼 검색 실패: {e}")
     matches = sorted(found, key=len)
     return matches[:limit]
 
@@ -391,7 +402,7 @@ def make_chart(symbol, interval="1d"):
     """캔들차트 → (PNG 버퍼, 캡션). 시간봉 차트는 한국시간 축으로 표시"""
     klines, source = get_klines_any(symbol, interval, limit=CHART_DAYS)
 
-    # 소스마다 컬럼 수가 다르므로 (바이낸스 12개, MEXC 8개) 앞 6개만 사용
+    # 소스마다 컬럼 수가 다르므로 앞 6개만 사용
     rows = [k[:6] for k in klines]
     df = pd.DataFrame(rows, columns=["time", "Open", "High", "Low", "Close", "Volume"])
     idx = pd.to_datetime(df["time"].astype(float), unit="ms", utc=True)
@@ -424,7 +435,8 @@ def make_chart(symbol, interval="1d"):
     buf.seek(0)
 
     last_close = float(klines[-1][4])
-    fut_mark = "✅ 상장" if is_binance_futures_listed(symbol) else "❌ 미상장"
+    bn_mark = "✅ 가능" if is_binance_futures_listed(symbol) else "❌ 불가"
+    okx_mark = "✅ 가능" if symbol in get_okx_futures_symbols() else "❌ 불가"
 
     if interval == "1d":
         stat_lines = (
@@ -445,7 +457,7 @@ def make_chart(symbol, interval="1d"):
     caption = (
         f"📈 {symbol}  현재가 {last_close:g}  [{source} · {iv_label}]\n"
         f"{stat_lines}\n"
-        f"바이낸스 선물: {fut_mark}"
+        f"선물: 바이낸스 {bn_mark} · OKX {okx_mark}"
     )
     return buf, caption
 
@@ -473,15 +485,23 @@ def send_photo(photo_buf, caption):
     r.raise_for_status()
 
 
+def _badges(r):
+    b = ""
+    if r.get("fut"):
+        b += "🅱"
+    if r.get("okx"):
+        b += "🅾"
+    return b
+
+
 def _format_section(title, entries, vkey):
     lines = [f"📊 <b>{title}</b>"]
     for i, r in enumerate(entries, 1):
         name = r["symbol"].replace("USDT", "")
-        fut = "⚡" if r.get("fut") else ""
         v = r[vkey]
         arrow = "🟢" if v["change_pct"] >= 0 else "🔴"
         lines.append(
-            f"{i}. <b>{name}</b>{fut} | 일변동 {v['std_vol']:.1f}% | "
+            f"{i}. <b>{name}</b>{_badges(r)} | 일변동 {v['std_vol']:.1f}% | "
             f"레인지 {v['range_pct']:.0f}% | {arrow} {v['change_pct']:+.1f}%"
         )
     return lines
@@ -489,14 +509,15 @@ def _format_section(title, entries, vkey):
 
 def format_message(top7, top30, top90):
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    lines = [f"🔥 <b>변동성 스크리너</b> ({now} KST)\n"]
+    lines = [f"🔥 <b>변동성 스크리너</b> — MEXC 선물 전체 ({now} KST)\n"]
     lines += _format_section(f"7일 변동성 TOP {TOP_N}", top7, "v7")
     lines.append("")
     lines += _format_section(f"30일 변동성 TOP {TOP_N}", top30, "v30")
     lines.append("")
     lines += _format_section(f"3개월 변동성 TOP {TOP_N}", top90, "v90")
     lines.append(
-        f"\n⚡ = 바이낸스 선물 상장 (선물 전용 코인 포함)\n"
+        f"\n🅱 = 바이낸스 선물 가능 · 🅾 = OKX 선물 가능\n"
+        f"(배지 없음 = MEXC 선물에서만 거래 가능)\n"
         f"💬 /1~/{TOP_N} 7일 | /m1~/m{TOP_N} 30일 | /q1~/q{TOP_N} 3개월 | /help"
     )
     return "\n".join(lines)
@@ -550,7 +571,7 @@ def handle_command(text, cache):
 
     if cmd == "show":
         if not cache.is_fresh():
-            send_message("🔄 최신 데이터 스캔 중... (1~2분)")
+            send_message("🔄 MEXC 선물 전체 스캔 중... (2~3분)")
             cache.update(*scan())
         send_message(format_message(cache.top7, cache.top30, cache.top90))
         return
@@ -563,7 +584,7 @@ def handle_command(text, cache):
         return
 
     if _is_rank_command(cmd) and not cache.top7:
-        send_message("🔄 순위 데이터가 없어 먼저 스캔합니다... (1~2분)")
+        send_message("🔄 순위 데이터가 없어 먼저 스캔합니다... (2~3분)")
         cache.update(*scan())
 
     symbol = parse_command(first, cache)
@@ -580,7 +601,7 @@ def handle_command(text, cache):
         if similar:
             suggestions = " ".join(f"/{s.lower()}" for s in similar)
             send_message(
-                f"⚠️ '{query}' 코인을 현물·선물·MEXC 어디에서도 찾을 수 없습니다.\n"
+                f"⚠️ '{query}' 코인을 바이낸스·MEXC 어디에서도 찾을 수 없습니다.\n"
                 f"혹시 이 중에 있나요? 👉 {suggestions}"
             )
         else:
